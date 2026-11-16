@@ -153,7 +153,7 @@ var loginLists = []string{remoteProjects, remoteConversations}
 // marketplaceDelays 为登录序列界面渲染后到读取插件市场目录的两种间隔（毫秒），官方 2.31.1 与 2.31.2 登录现场各出现一次
 var marketplaceDelays = [2][2]int{{17, 21}, {178, 184}}
 
-// listRemotes 记下本虚拟进程轮询远程列表，并在后台于 32–112 ms 后并发读取 lists
+// listRemotes 记下本虚拟进程轮询远程列表，并在后台于 32–112 ms 后并发读取 lists；任一列表返回 REMOTE_AGENT_NOT_AVAILABLE 时记下账户没有远程 agent
 func (c *Client) listRemotes(ctx context.Context, lists []string) {
 	c.mu.Lock()
 	c.hub.remote = true
@@ -164,10 +164,23 @@ func (c *Client) listRemotes(ctx context.Context, lists []string) {
 		}
 		var group sync.WaitGroup
 		for _, list := range lists {
-			group.Go(func() { c.get(ctx, endpointAICode+"/v1alpha/"+list, nil) })
+			group.Go(func() {
+				if remoteUnavailable(c.get(ctx, endpointAICode+"/v1alpha/"+list, nil)) {
+					c.mu.Lock()
+					c.hub.remoteBlocked = true
+					c.mu.Unlock()
+				}
+			})
 		}
 		group.Wait()
 	}()
+}
+
+// remoteUnavailable 判断远程列表请求是否因账户没有 Remote Agents 而永久不可用：该错误重试不会恢复，继续轮询只会产生 403 噪声
+func remoteUnavailable(err error) bool {
+	upstream, ok := errors.AsType[*UpstreamError](err)
+	return ok && (upstream.Reason() == "REMOTE_AGENT_NOT_AVAILABLE" ||
+		strings.Contains(string(upstream.Body), "REMOTE_AGENT_NOT_AVAILABLE"))
 }
 
 // jitter 返回 d 上下 20% 内均匀分布的时长
@@ -175,7 +188,7 @@ func jitter(d time.Duration) time.Duration {
 	return d - d/5 + rand.N(2*(d/5)+1)
 }
 
-// pollRemote 在启动读取之后按官方节奏重新读取一个远程列表：成功后等 period，失败后从 remoteBackoff 起每次翻倍到 remoteBackoffLimit，每次等待都上下浮动 20%；ctx 结束时返回
+// pollRemote 在启动读取之后按官方节奏重新读取一个远程列表：成功后等 period，失败后从 remoteBackoff 起每次翻倍到 remoteBackoffLimit，每次等待都上下浮动 20%；账户没有远程 agent 时停止轮询；ctx 结束时返回
 func (c *Client) pollRemote(ctx context.Context, list string, period time.Duration) {
 	wait, backoff := period, remoteBackoff
 	for {
@@ -184,7 +197,19 @@ func (c *Client) pollRemote(ctx context.Context, list string, period time.Durati
 		case <-ctx.Done():
 			return
 		}
-		if c.get(ctx, endpointAICode+"/v1alpha/"+list, nil) != nil {
+		c.mu.Lock()
+		blocked := c.hub.remoteBlocked
+		c.mu.Unlock()
+		if blocked {
+			return
+		}
+		if err := c.get(ctx, endpointAICode+"/v1alpha/"+list, nil); err != nil {
+			if remoteUnavailable(err) {
+				c.mu.Lock()
+				c.hub.remoteBlocked = true
+				c.mu.Unlock()
+				return
+			}
 			wait, backoff = backoff, min(2*backoff, remoteBackoffLimit)
 			continue
 		}
