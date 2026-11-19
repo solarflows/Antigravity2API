@@ -62,6 +62,9 @@ type hub struct {
 	market    []marketplaceEvent
 	plugins   bool
 	remote    bool
+
+	// remoteBlocked 表示账户没有 Remote Agents，远程列表不再轮询
+	remoteBlocked bool
 }
 
 // eventShape 表示 clearcut 事件的外层形态：blank 为真时公共参数留空，flags 为真时附实验开关，empty 为真时附空的开关字段，ui 为真时带界面会话与事件时刻，env 为真时载荷带客户端环境，compared 为真时开关取对照用的 listExperiments 开关
